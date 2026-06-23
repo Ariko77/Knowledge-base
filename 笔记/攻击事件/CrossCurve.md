@@ -1,0 +1,402 @@
+# CrossCurve
+
+源码指令：
+
+```solidity
+git clone https://github.com/eywa-protocol/eywa-cdp.git
+git clone https://github.com/eywa-protocol/eywa-clp.git
+git clone https://github.com/eywa-protocol/eywa-oracle.git
+```
+
+漏洞文件
+
+contracts/
+
+├ bridge/
+
+│   ├ ReceiverAxelar.sol
+
+│   ├ Portal.sol
+
+│   └ PortalV2.sol.
+
+## 演示一下正常来说的跨链资产的转移
+
+```solidity
+function execute(
+        bytes32 commandId,
+        string calldata sourceChain,
+        string calldata sourceAddress,
+        bytes calldata payload
+    ) external virtual {
+        bytes32 payloadHash = keccak256(payload);
+
+        if (!gateway().validateContractCall(commandId, sourceChain, sourceAddress, payloadHash))
+            revert NotApprovedByGateway();
+
+        _execute(commandId, sourceChain, sourceAddress, payload);
+    }
+
+    /**
+     * @dev Internal virtual function to be overridden by child contracts to execute the command.
+     * It allows child contracts to define their custom command execution logic.
+     * @param commandId The identifier of the command to execute.
+     * @param sourceChain The name of the source chain from which the command originated.
+     * @param sourceAddress The address on the source chain that sent the command.
+     * @param payload The payload of the command to be executed.
+     */
+    function _execute(
+        bytes32 commandId,
+        string calldata sourceChain,
+        string calldata sourceAddress,
+        bytes calldata payload
+    ) internal virtual;
+```
+
+### execute函数参数介绍
+
+* \*\*commandId ：\*\*跨链执行的唯一编号
+* sourceChain ：这调消息来自那条链
+* sourceAddress  ：这条消息的合约地址具体是多少
+* payload: 合约真正需要传递和执行的跨链消息内容
+
+其中if检查会将所有参数打包（其中payload会进行hash打包）一起交给Gateway ,只有Gateway返回true,才会继续执行后面的逻辑。
+
+其中Geteway里面的检查是啥：
+
+```solidity
+function validateContractCall(
+    bytes32 commandId,
+    string calldata sourceChain,
+    string calldata sourceAddress,
+    bytes32 payloadHash
+) external override returns (bool valid) {
+    bytes32 key = _getIsContractCallApprovedKey(commandId, sourceChain, sourceAddress, msg.sender, payloadHash);
+
+    valid = getBool(key);
+
+    if (valid) {
+        _setBool(key, false);
+        emit ContractCallExecuted(commandId);
+    }
+}
+```
+
+在调用 `execute()` 时，合约会计算 `payload` 的哈希值，并将 `commandId`、`sourceChain`、`sourceAddress`、目标合约地址以及 `payloadHash` 组合生成一个唯一键值。\
+该键值会用于在 **Axelar Gateway 合约的存储中查询是否存在对应的批准记录**。\
+若该记录存在且为 `true`，说明这条跨链消息已经通过网关验证并被批准执行，函数返回 `true` 并继续执行后续逻辑；否则验证失败并回退。
+
+同时我也产生了疑问，我们的 \*\*Axelar Gateway 合约的存储 \*\*在哪里被记录了
+
+```solidity
+    function callContract(
+        string calldata destinationChain,
+        string calldata destinationContractAddress,
+        bytes calldata payload
+    ) external {
+        emit ContractCall(msg.sender, destinationChain, destinationContractAddress, keccak256(payload), payload);
+    }
+```
+
+### 情况 1：用户要发“跨链消息”
+
+如果用户是要通过 Axelar 做一次普通的 GMP 跨链调用，那么源链侧通常要先调用 Gateway 的：
+
+* `callContract()`：只发消息，不带 token
+* `callContractWithToken()`：发消息并附带 gateway token
+
+Axelar 官方开发文档就是这么写的：发起一次 interchain transaction 时，源链先调用 Gateway 的 `callContract()` 或 `callContractWithToken()`，然后还要给 Gas Service 付 gas。
+
+所以这部分你可以理解成：
+
+用户在源链想发起一次跨链调用，通常要先走 `callContract()` 这一类源链入口。
+
+***
+
+### 情况 2：用户并不一定“直接调用 Gateway”
+
+很多真实项目里，**用户不是自己手动直接去调 Gateway**，而是：
+
+```plain
+用户
+ ↓
+项目自己的业务合约
+ ↓
+业务合约内部再去调用 Gateway.callContract()
+```
+
+因为用户一般是跟 dApp 交互，不是直接跟跨链底层网关打交道。Axelar 的 GMP 本质是“从链 A 调链 B 的合约函数”，开发者可以让自己的应用合约去触发这一步。
+
+所以更完整的话应该是：
+
+正常情况下，跨链消息在源链需要通过 `callContract()` 或 `callContractWithToken()` 进入 Axelar 的消息流程，但这个调用既可以由用户直接发起，也可以由项目自己的业务合约代为发起。
+
+总体流程：
+
+```solidity
+源链 callContract / callContractWithToken
+ ↓
+Axelar 网络处理
+ ↓
+目标链 Gateway 标记 approved
+ ↓
+目标合约 execute()
+ ↓
+目标合约内部 validateContractCall()
+ ↓
+继续执行 payload
+```
+
+## expressExecute函数
+
+```solidity
+    function expressExecute(
+        bytes32 commandId,
+        string calldata sourceChain,
+        string calldata sourceAddress,
+        bytes calldata payload
+    ) external payable virtual {
+        if (gateway().isCommandExecuted(commandId)) revert AlreadyExecuted();
+
+        address expressExecutor = msg.sender;
+        bytes32 payloadHash = keccak256(payload);
+
+        emit ExpressExecuted(commandId, sourceChain, sourceAddress, payloadHash, expressExecutor);
+
+        _setExpressExecutor(commandId, sourceChain, sourceAddress, payloadHash, expressExecutor);
+
+        _execute(commandId, sourceChain, sourceAddress, payload);
+    }
+
+```
+
+`expressExecute()` 是 Axelar 提供的快速执行接口，用于在消息尚未被 Gateway 完整确认前提前执行跨链消息，以提升跨链体验。\
+与正常的 `execute()` 不同，该函数只检查 `commandId` 是否已经执行（`isCommandExecuted`），而没有进行 `validateContractCall()` 的 Gateway 授权验证。\
+在 CrossCurve 的实现中，`expressExecute()` 在缺少 Gateway 授权校验的情况下直接调用 `_execute()`。\
+而 `_execute()` 默认假设消息已经通过 Gateway 验证，仅对 `sourceChain` 与 `sourceAddress` 进行简单的 peer 白名单检查。\
+由于这些参数均来自外部输入，攻击者可以伪造合法的 peer 地址，从而绕过验证，最终触发后续的跨链执行逻辑，导致资金被非法解锁。
+
+## CrossCureve协议内的execute函数
+
+```solidity
+ function _execute(
+        string calldata sourceChain,
+        string calldata sourceAddress,
+        bytes calldata payload_
+    ) internal override {
+        require(peers[sourceChain] == sourceAddress.toAddress(), "ReceiverAxelar: wrong peer");
+        bytes32 requestId;
+        bytes32 sender;
+        uint256 chainIdFrom;
+        uint256 length = payload_.length - 1;
+        bytes memory data = new bytes(length);
+        for (uint i; i < length; ++i) {
+            data[i] = payload_[i];
+        }
+
+        if (payload_[payload_.length - 1] == 0x01) {
+            require(data.length == 128, "ReceiverAxelar: Invalid message length");
+            bytes32 payload;
+            (payload, sender, chainIdFrom, requestId) = abi.decode(data, (bytes32, bytes32, uint256, bytes32));
+            IReceiver(receiver).receiveHash(sender, uint64(chainIdFrom), payload, requestId);
+        } else if (payload_[payload_.length - 1] == 0x00) {
+            bytes memory payload;
+            (payload, sender, chainIdFrom, requestId) = abi.decode(data, (bytes, bytes32, uint256, bytes32));
+            IReceiver(receiver).receiveData(sender, uint64(chainIdFrom), payload, requestId);
+        } else {
+            revert("ReceiverAxelar: wrong message");
+        }
+    }
+```
+
+由于 `ReceiverAxelar` 继承自 **AxelarExecutable**，因此协议对其跨链执行逻辑进行了重写，实现了自己的 `_execute()` 函数。\
+在 `_execute()` 中，合约只对 `sourceChain` 和 `sourceAddress` 进行了 peer 白名单检查，即：
+
+```solidity
+require(peers[sourceChain] == sourceAddress.toAddress())
+```
+
+因此，只要攻击者查询到已经配置在白名单中的 peer 地址，并在调用时伪造相应的 `sourceChain` 和 `sourceAddress` 参数，即可通过该检查。
+
+正常情况下，跨链消息在 `execute()` 路径中会先调用\
+`gateway.validateContractCall()`\
+来验证该跨链消息是否已经经过 Axelar Gateway 的授权确认。\
+但在 `expressExecute()` 快速执行路径中，这一步验证被省略，只进行了 `commandId` 是否已执行的检查。
+
+因此攻击者可以直接调用 `expressExecute()`，构造伪造的跨链消息并绕过 Gateway 授权验证，从而触发 `_execute()` 中的后续逻辑，最终导致资金被非法解锁。
+
+```solidity
+wang@wangjianfeng:/mnt/e/工作室/Defi/攻击事件及其复现/CrossCurve事件$ cast run 0x37d9b911ef710be851a2e08e1cfc61c2544db0f208faeade29ee98cc7506ccc2 --quick -vvvvv
+Traces:
+  [659143] 0xB2185950F5A0A46687ac331916508aadA202e063::expressExecute(0x5e77d6809707bb0c062a5c82270d7d939c4ad094dc683ccd4738131925cdeb01, "berachain", "0x5eEdDcE72530e4fC96d43E3d70Fe09aD0D037175", 0x0000000000000000000000000000000000000000000000000000000000000080000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d56500000000000000000000000000000000000000000000000000000000000138de105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c00000000000000000000000000000000000000000000000000000000000003e0000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000003400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d56500000000000000000000000000000000000000000000000000000000000002844dc9fb35105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000026000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000242550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000008cb8c4263eb26b2349d74ea2cb1b27bc40709e120000000000000000000000000000000000000000033b1666d4acf7d79021f761000000000000000000000000cda36e1b514fcc52e4ca1238491e6e789a11a8bb000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000138de000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000642509db2b4dc9fb3500000000000000000000000000000000000000000000000000000000000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d56500000000000000000000000000000000000000000000000000000000000138de0000000000000000000000000000000000000000000000000000000000)
+    ├─ [7746] 0x4F4495243837681061C4743b74B3eEdf548D56A5::isCommandExecuted(0x5e77d6809707bb0c062a5c82270d7d939c4ad094dc683ccd4738131925cdeb01) [staticcall]
+    │   ├─ [2751] 0x99B5FA03a5ea4315725c43346e55a6A6fbd94098::isCommandExecuted(0x5e77d6809707bb0c062a5c82270d7d939c4ad094dc683ccd4738131925cdeb01) [delegatecall]
+    │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000000
+    │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000000
+    ├─  emit topic 0: 0x6e18757e81c44a367109cbaa499add16f2ae7168aab9715c3cdc36b0f7ccce92
+    │        topic 1: 0x5e77d6809707bb0c062a5c82270d7d939c4ad094dc683ccd4738131925cdeb01
+    │        topic 2: 0x000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd
+    │           data: 0x000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a011b6a2c7e54df86b27ccc6706c6416c9b296f92bc5e5896a47ced0a9cb4cd129000000000000000000000000000000000000000000000000000000000000000962657261636861696e0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002a30783565456444634537323533306534664339366434334533643730466530396144304430333731373500000000000000000000000000000000000000000000
+    ├─ [306215] 0x0F00F1a6A32e644815C5686aD7dc305A54B11200::receiveData(0x000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d565, 80094 [8.009e4], 0x000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000003400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d56500000000000000000000000000000000000000000000000000000000000002844dc9fb35105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000026000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000242550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000008cb8c4263eb26b2349d74ea2cb1b27bc40709e120000000000000000000000000000000000000000033b1666d4acf7d79021f761000000000000000000000000cda36e1b514fcc52e4ca1238491e6e789a11a8bb000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000138de000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000642509db2b4dc9fb3500000000000000000000000000000000000000000000000000000000000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d56500000000000000000000000000000000000000000000000000000000000138de00000000000000000000000000000000000000000000000000000000, 0x105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c)
+    │   ├─ [16620] 0xf3792bae7F35DCdE2916c6e6A72cCD3a5330d565::receiveValidatedData(0x4dc9fb35, 0x000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d565, 80094 [8.009e4])
+    │   │   ├─ [11436] 0x0ffE0bc66F1698af5c08DFE4Ca32f7b885acc33F::receiveValidatedData(0x4dc9fb35, 0x000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d565, 80094 [8.009e4]) [delegatecall]
+    │   │   │   ├─ [2458] 0x9949CEd50aBCCFCF182662e9B42c2b5384146045::receiver() [staticcall]
+    │   │   │   │   └─ ← [Return] 0x0000000000000000000000000f00f1a6a32e644815c5686ad7dc305a54b11200
+    │   │   │   ├─ [2583] 0x9949CEd50aBCCFCF182662e9B42c2b5384146045::routerV3(80094 [8.009e4]) [staticcall]
+    │   │   │   │   └─ ← [Return] 0x000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d565
+    │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   ├─ [175963] 0xf3792bae7F35DCdE2916c6e6A72cCD3a5330d565::resume(0x105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c, 0, ["BU"], [0x0000000000000000000000008cb8c4263eb26b2349d74ea2cb1b27bc40709e120000000000000000000000000000000000000000033b1666d4acf7d79021f761000000000000000000000000cda36e1b514fcc52e4ca1238491e6e789a11a8bb000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000138de0000000000000000000000000000000000000000000000000000000000000000], 0x)
+    │   │   ├─ [173180] 0x0ffE0bc66F1698af5c08DFE4Ca32f7b885acc33F::resume(0x105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c, 0, ["BU"], [0x0000000000000000000000008cb8c4263eb26b2349d74ea2cb1b27bc40709e120000000000000000000000000000000000000000033b1666d4acf7d79021f761000000000000000000000000cda36e1b514fcc52e4ca1238491e6e789a11a8bb000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000138de0000000000000000000000000000000000000000000000000000000000000000], 0x) [delegatecall]
+    │   │   │   ├─ [458] 0x9949CEd50aBCCFCF182662e9B42c2b5384146045::receiver() [staticcall]
+    │   │   │   │   └─ ← [Return] 0x0000000000000000000000000f00f1a6a32e644815c5686ad7dc305a54b11200
+    │   │   │   ├─ [7483] 0xf3792bae7F35DCdE2916c6e6A72cCD3a5330d565::paused() [staticcall]
+    │   │   │   │   ├─ [2311] 0xf757c28c81E19Fe007f35Aec6Bf4Dd0e4C00F00E::paused() [delegatecall]
+    │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   ├─ [143413] 0xf3792bae7F35DCdE2916c6e6A72cCD3a5330d565::executeCrosschainOp(true, 0x657d6a520417248f91661005448c99dcf1f631cad6e9c4800d1e2c4e089d8bea, 0x0000000000000000000000000000000000000000000000000000000000000000, 0x0000000000000000000000008cb8c4263eb26b2349d74ea2cb1b27bc40709e120000000000000000000000000000000000000000033b1666d4acf7d79021f761000000000000000000000000cda36e1b514fcc52e4ca1238491e6e789a11a8bb000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000138de0000000000000000000000000000000000000000000000000000000000000000, (0, 0x0000000000000000000000000000000000000000000000000000000000000000, 0x0000000000000000000000000000000000000000000000000000000000000000)) [delegatecall]
+    │   │   │   │   ├─ [138139] 0x69acC92b150780df1F7eD5bf1f1b4769FcBbEfc1::executeCrosschainOp(true, 0x657d6a520417248f91661005448c99dcf1f631cad6e9c4800d1e2c4e089d8bea, 0x0000000000000000000000000000000000000000000000000000000000000000, 0x0000000000000000000000008cb8c4263eb26b2349d74ea2cb1b27bc40709e120000000000000000000000000000000000000000033b1666d4acf7d79021f761000000000000000000000000cda36e1b514fcc52e4ca1238491e6e789a11a8bb000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000138de0000000000000000000000000000000000000000000000000000000000000000, (0, 0x0000000000000000000000000000000000000000000000000000000000000000, 0x0000000000000000000000000000000000000000000000000000000000000000)) [delegatecall]
+    │   │   │   │   │   ├─ [2610] 0x9949CEd50aBCCFCF182662e9B42c2b5384146045::portal(1) [staticcall]
+    │   │   │   │   │   │   └─ ← [Return] 0x000000000000000000000000ac8f44ceca92b2a4b30360e5bd3043850a0ffcbe
+    │   │   │   │   │   ├─ [83352] 0xAc8f44ceCa92b2a4b30360E5bd3043850a0FFcbE::unlock(0x8cb8C4263EB26b2349d74ea2cB1B27bc40709e12, 999887441776713115294103393 [9.998e26], 0xcDA36E1B514fCC52e4cA1238491e6e789A11A8Bb, 0x632400F42e96A5DEB547a179ca46b02C22CD25cD)
+    │   │   │   │   │   │   ├─ [2556] 0x9949CEd50aBCCFCF182662e9B42c2b5384146045::router(1) [staticcall]
+    │   │   │   │   │   │   │   └─ ← [Return] 0x000000000000000000000000f3792bae7f35dcde2916c6e6a72ccd3a5330d565
+    │   │   │   │   │   │   ├─ [2415] 0x9949CEd50aBCCFCF182662e9B42c2b5384146045::whitelist() [staticcall]
+    │   │   │   │   │   │   │   └─ ← [Return] 0x00000000000000000000000010a6a2ffdf88d9a7c7e0cc34b0e84cc24f827e95
+    │   │   │   │   │   │   ├─ [2394] 0x9949CEd50aBCCFCF182662e9B42c2b5384146045::treasury() [staticcall]
+    │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000004400671b8238b5e0c7c9d7572746d236cd292845
+    │   │   │   │   │   │   ├─ [16052] 0x10A6A2fFDf88D9a7C7E0cC34B0E84cc24F827E95::tokenState(0x8cb8C4263EB26b2349d74ea2cB1B27bc40709e12) [staticcall]
+    │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │   │   │   ├─ [1897] 0x10A6A2fFDf88D9a7C7E0cC34B0E84cc24F827E95::bridgeFee(0x8cb8C4263EB26b2349d74ea2cB1B27bc40709e12) [staticcall]
+    │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │   │   │   ├─ [29789] 0x8cb8C4263EB26b2349d74ea2cB1B27bc40709e12::transfer(0x632400F42e96A5DEB547a179ca46b02C22CD25cD, 999787453032535443982573983 [9.997e26])
+    │   │   │   │   │   │   │   ├─ emit Transfer(from: 0xAc8f44ceCa92b2a4b30360E5bd3043850a0FFcbE, to: 0x632400F42e96A5DEB547a179ca46b02C22CD25cD, value: 999787453032535443982573983 [9.997e26])
+    │   │   │   │   │   │   │   ├─  storage changes:
+    │   │   │   │   │   │   │   │   @ 0x22bef4a554a209788d01c4e7901b2a28c7f0b3157bee8b5c93defe2e11262867: 0x0000000000000000000000000000000000000000033b1666d4acf7d79021f761 → 0x00000000000000000000000000000000000000000000152c66932a85521d15c2
+    │   │   │   │   │   │   │   │   @ 0xfcdba54dca4a7c5e4a8325c61a175087e173f5fa2271bd31b25d8075e1f696a1: 0 → 0x0000000000000000000000000000000000000000033b013a6e19cd523e04e19f
+    │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │   │   │   ├─ [7889] 0x8cb8C4263EB26b2349d74ea2cB1B27bc40709e12::transfer(0x4400671b8238B5E0c7c9d7572746d236cd292845, 99988744177671311529410 [9.998e22])
+    │   │   │   │   │   │   │   ├─ emit Transfer(from: 0xAc8f44ceCa92b2a4b30360E5bd3043850a0FFcbE, to: 0x4400671b8238B5E0c7c9d7572746d236cd292845, value: 99988744177671311529410 [9.998e22])
+    │   │   │   │   │   │   │   ├─  storage changes:
+    │   │   │   │   │   │   │   │   @ 0x22bef4a554a209788d01c4e7901b2a28c7f0b3157bee8b5c93defe2e11262867: 0x00000000000000000000000000000000000000000000152c66932a85521d15c2 → 0
+    │   │   │   │   │   │   │   │   @ 0xb8ad894acf89e075a07fd2febc80f3e9f1e07ff5e6ab4f29c28eb0b7990463a8: 0x000000000000000000000000000000000000000000000005e75df664e84696e3 → 0x0000000000000000000000000000000000000000000015324df120ea3a63aca5
+    │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │   │   │   ├─ emit Unlocked(: 0x8cb8C4263EB26b2349d74ea2cB1B27bc40709e12, : 999887441776713115294103393 [9.998e26], : 0xcDA36E1B514fCC52e4cA1238491e6e789A11A8Bb, : 0x632400F42e96A5DEB547a179ca46b02C22CD25cD)
+    │   │   │   │   │   │   ├─  storage changes:
+    │   │   │   │   │   │   │   @ 0x5f28358b69080cc80da35ac0b2fed6ac6d1b07cf860b368cd3a0c0f54f90d50b: 0x0000000000000000000000000000000000000000033b1666d4acf7d79021f761 → 0
+    │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000033b013a6e19cd523e04e19f
+    │   │   │   │   │   ├─  storage changes:
+    │   │   │   │   │   │   @ 0x3c1fdb7906eebd24e56cc19552b193e746b76dced69325142b344c7471d88b3a: 0 → 1
+    │   │   │   │   │   │   @ 0x3c1fdb7906eebd24e56cc19552b193e746b76dced69325142b344c7471d88b39: 0 → 0x7b72a3121af8f17dfb6fbf8820913f2b43446414a4f3c727128bec98097e8a12
+    │   │   │   │   │   └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000033b013a6e19cd523e04e19f000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   │   └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000033b013a6e19cd523e04e19f000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   ├─  emit topic 0: 0x830adbcf80ee865e0f0883ad52e813fdbf061b0216b724694a2b4e06708d243c
+    │   │   │   │        topic 1: 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │        topic 2: 0x105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c
+    │   │   │   │        topic 3: 0x0000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   │           data: 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   └─ ← [Stop]
+    │   │   └─ ← [Return]
+    │   ├─ emit RequestExecuted(: 0x105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c)
+    │   ├─ emit Received(: 0xB2185950F5A0A46687ac331916508aadA202e063, : 0x105b391f32e7c1e4224ff1a86ab4c6ab0742f5c68f39d485d04b149bda59a97c, : false)
+    │   ├─  storage changes:
+    │   │   @ 0xe31d98177bc44091d6ed615036eb737a66ce91683907fdf70decf045bf17483b: 0 → 1
+    │   └─ ← [Stop]
+    ├─  storage changes:
+    │   @ 0xe4bdc13ab988d6349066f618efe7a4b6e88b752319927fcd4fc6699d8cf26a44: 0 → 0x000000000000000000000000632400f42e96a5deb547a179ca46b02c22cd25cd
+    └─ ← [Stop]
+
+
+Transaction successfully executed.
+Gas used: 618071
+```
+
+其中上面的trace是攻击者的整体交易。
+
+现在对这些trace进行一个分析。
+
+\*\*第一步：攻击者调用 \*\*<code>**expressExecute()**</code>\
+攻击者首先调用 `ReceiverAxelar` 的 `expressExecute()` 函数，并传入伪造的 `commandId`、`sourceChain`、`sourceAddress` 以及恶意构造的 `payload`。由于该函数仅检查 `commandId` 是否已经执行过，而没有像正常 `execute()` 路径那样调用 `validateContractCall()` 对跨链消息进行 Gateway 授权验证，因此攻击者可以顺利绕过这一步检查。
+
+**第二步：恶意 **<code>**payload**</code>** 被 **<code>**receiveData()**</code>** 处理**\
+随后，这笔恶意构造的 `payload` 被继续传入 `receiveData()`。协议会对其中的数据进行解码，并将其当作一条正常的跨链消息继续向后执行。也就是说，攻击者伪造的跨链消息已经成功进入了协议内部处理流程。
+
+**第三步：协议调用 **<code>**resume()**</code>**，并将其作为正常跨链操作恢复执行**\
+在通过后续校验后，协议进一步调用 `resume()`，将这条消息当作一笔正常的跨链请求继续处理。从调用参数来看，该操作类型为 `BU`，说明协议已经开始按照预设的跨链业务逻辑执行这笔请求。
+
+**第四步：进入 **<code>**executeCrosschainOp()**</code>**，最终调用 **<code>**PortalV2.unlock()**</code>\
+接下来，协议进入 `executeCrosschainOp()`，并最终调用 `PortalV2.unlock()`，释放 Portal 中锁定的 EYWA 资产。大部分资产被转给攻击者地址，另有一小部分作为手续费转入 treasury。由此可以看出，协议并没有把这笔请求识别为恶意交易，而是将其**完整地当作一次正常跨链交易执行**，最终导致攻击者获利。
+
+## 总结
+
+本次漏洞的核心原因在于：`expressExecute()` 缺失了正常跨链执行路径中最关键的 Gateway 授权验证，导
+
+致攻击者能够伪造跨链消息，并最终触发真实的资产解锁逻辑
+
+# 后记
+
+## 简单介绍跨链
+
+目前网络上有各种各样的公链，其中如果我想让我eth链上的U转移到 Arbitrum上面来用，是没有办法可以进行一个直接的转移，所以一般会通过智能合约来进行一个 锁资产+ 铸造 或者，销毁 + 解锁资产。
+
+## 常见的两种跨链资产的交易方式
+
+### 第一种：Lock + Mint（锁定 + 铸造）
+
+在这种模式下，跨链桥会先在源链锁定用户资产，然后在目标链铸造对应数量的映射资产。
+
+具体流程如下：
+
+1. 用户在 **A 链** 将 100 USDT 发送到跨链桥合约。
+2. 跨链桥合约将这 100 USDT **锁定在合约中**，用户在 A 链不再拥有这部分资产。
+3. 跨链网络（如 Axelar、LayerZero 等）将这笔交易的跨链消息发送到 **B 链**。
+4. B 链上的桥合约根据该消息 **mint 100 个映射资产**（例如 aUSDT）。
+5. 用户在 B 链收到这 100 个映射资产并可以正常使用。
+
+可以简单表示为：
+
+```plain
+A链: 用户 → Bridge → Lock 100 USDT
+                    ↓
+              跨链消息验证
+                    ↓
+B链: Bridge → Mint 100 aUSDT → 用户
+```
+
+这里的关键点是：
+
+* **原始资产被锁在源链**
+* **目标链产生对应的映射资产**
+
+***
+
+### 第二种：Burn + Unlock（销毁 + 解锁）
+
+这种模式通常用于用户**从目标链返回源链**时。
+
+具体流程如下：
+
+1. 用户在 **A 链** 持有 100 个映射资产（例如 aUSDT）。
+2. 用户在跨链桥合约中将这 100 个映射资产 **burn（销毁）**。
+3. 跨链网络将销毁事件作为跨链消息发送到 **B 链**。
+4. B 链上的桥合约根据消息 **unlock（解锁）之前锁定的 100 USDT**。
+5. 用户在 B 链获得真实资产。
+
+可以表示为：
+
+```plain
+A链: 用户 → Bridge → Burn 100 aUSDT
+                    ↓
+              跨链消息验证
+                    ↓
+B链: Bridge → Unlock 100 USDT → 用户
+```
+
+这里的关键点是：
+
+* **映射资产被销毁**
+* **源链锁定资产被释放**
+
+
+> 更新: 2026-03-16 20:42:27  
+> 原文: <https://www.yuque.com/xiaoyuhushenfu/yzin4n/ysyrauaxrahptzdq>

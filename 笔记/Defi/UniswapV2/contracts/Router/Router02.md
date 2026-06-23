@@ -1,0 +1,1134 @@
+# Router02
+
+**路由（Router）**\
+由于路由是无状态的（stateless），并且不持有任何代币余额，所以在必要时可以安全、无需信任地被替换。\
+这种情况可能出现在以下场景：
+
+* 发现了更高效的智能合约模式；
+* 需要增加新的功能。
+
+因此，路由会有版本号（release numbers），从 **01** 开始。目前推荐使用的版本是 **02**。
+
+```solidity
+pragma solidity =0.6.6;
+
+import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol';
+import '@uniswap/lib/contracts/libraries/TransferHelper.sol';
+
+import './interfaces/IUniswapV2Router02.sol';
+import './libraries/UniswapV2Library.sol';
+import './libraries/SafeMath.sol';
+import './interfaces/IERC20.sol';
+import './interfaces/IWETH.sol';
+
+contract UniswapV2Router02 is IUniswapV2Router02 {
+    using SafeMath for uint;
+
+    address public immutable override factory;
+    address public immutable override WETH;
+
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, 'UniswapV2Router: EXPIRED');
+        _;
+    }
+
+    constructor(address _factory, address _WETH) public {
+        factory = _factory;
+        WETH = _WETH;
+    }
+
+    receive() external payable {
+        assert(msg.sender == WETH); // only accept ETH via fallback from the WETH contract
+    }
+
+    // **** ADD LIQUIDITY ****
+    function _addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin
+    ) internal virtual returns (uint amountA, uint amountB) {
+        // create the pair if it doesn't exist yet
+        if (IUniswapV2Factory(factory).getPair(tokenA, tokenB) == address(0)) {
+            IUniswapV2Factory(factory).createPair(tokenA, tokenB);
+        }
+        (uint reserveA, uint reserveB) = UniswapV2Library.getReserves(factory, tokenA, tokenB);
+        if (reserveA == 0 && reserveB == 0) {
+            (amountA, amountB) = (amountADesired, amountBDesired);
+        } else {
+            uint amountBOptimal = UniswapV2Library.quote(amountADesired, reserveA, reserveB);
+            if (amountBOptimal <= amountBDesired) {
+                require(amountBOptimal >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+                (amountA, amountB) = (amountADesired, amountBOptimal);
+            } else {
+                uint amountAOptimal = UniswapV2Library.quote(amountBDesired, reserveB, reserveA);
+                assert(amountAOptimal <= amountADesired);
+                require(amountAOptimal >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+                (amountA, amountB) = (amountAOptimal, amountBDesired);
+            }
+        }
+    }
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external virtual override ensure(deadline) returns (uint amountA, uint amountB, uint liquidity) {
+        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        TransferHelper.safeTransferFrom(tokenA, msg.sender, pair, amountA);
+        TransferHelper.safeTransferFrom(tokenB, msg.sender, pair, amountB);
+        liquidity = IUniswapV2Pair(pair).mint(to);
+    }
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external virtual override payable ensure(deadline) returns (uint amountToken, uint amountETH, uint liquidity) {
+        (amountToken, amountETH) = _addLiquidity(
+            token,
+            WETH,
+            amountTokenDesired,
+            msg.value,
+            amountTokenMin,
+            amountETHMin
+        );
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        TransferHelper.safeTransferFrom(token, msg.sender, pair, amountToken);
+        IWETH(WETH).deposit{value: amountETH}();
+        assert(IWETH(WETH).transfer(pair, amountETH));
+        liquidity = IUniswapV2Pair(pair).mint(to);
+        // refund dust eth, if any
+        if (msg.value > amountETH) TransferHelper.safeTransferETH(msg.sender, msg.value - amountETH);
+    }
+
+    // **** REMOVE LIQUIDITY ****
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) public virtual override ensure(deadline) returns (uint amountA, uint amountB) {
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        IUniswapV2Pair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair
+        (uint amount0, uint amount1) = IUniswapV2Pair(pair).burn(to);
+        (address token0,) = UniswapV2Library.sortTokens(tokenA, tokenB);
+        (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);
+        require(amountA >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+        require(amountB >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+    }
+    function removeLiquidityETH(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) public virtual override ensure(deadline) returns (uint amountToken, uint amountETH) {
+        (amountToken, amountETH) = removeLiquidity(
+            token,
+            WETH,
+            liquidity,
+            amountTokenMin,
+            amountETHMin,
+            address(this),
+            deadline
+        );
+        TransferHelper.safeTransfer(token, to, amountToken);
+        IWETH(WETH).withdraw(amountETH);
+        TransferHelper.safeTransferETH(to, amountETH);
+    }
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external virtual override returns (uint amountA, uint amountB) {
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        uint value = approveMax ? uint(-1) : liquidity;
+        IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        (amountA, amountB) = removeLiquidity(tokenA, tokenB, liquidity, amountAMin, amountBMin, to, deadline);
+    }
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external virtual override returns (uint amountToken, uint amountETH) {
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        uint value = approveMax ? uint(-1) : liquidity;
+        IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        (amountToken, amountETH) = removeLiquidityETH(token, liquidity, amountTokenMin, amountETHMin, to, deadline);
+    }
+
+    // **** REMOVE LIQUIDITY (supporting fee-on-transfer tokens) ****
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) public virtual override ensure(deadline) returns (uint amountETH) {
+        (, amountETH) = removeLiquidity(
+            token,
+            WETH,
+            liquidity,
+            amountTokenMin,
+            amountETHMin,
+            address(this),
+            deadline
+        );
+        TransferHelper.safeTransfer(token, to, IERC20(token).balanceOf(address(this)));
+        IWETH(WETH).withdraw(amountETH);
+        TransferHelper.safeTransferETH(to, amountETH);
+    }
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external virtual override returns (uint amountETH) {
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        uint value = approveMax ? uint(-1) : liquidity;
+        IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        amountETH = removeLiquidityETHSupportingFeeOnTransferTokens(
+            token, liquidity, amountTokenMin, amountETHMin, to, deadline
+        );
+    }
+
+    // **** SWAP ****
+    // requires the initial amount to have already been sent to the first pair
+    function _swap(uint[] memory amounts, address[] memory path, address _to) internal virtual {
+        for (uint i; i < path.length - 1; i++) {
+            (address input, address output) = (path[i], path[i + 1]);
+            (address token0,) = UniswapV2Library.sortTokens(input, output);
+            uint amountOut = amounts[i + 1];
+            (uint amount0Out, uint amount1Out) = input == token0 ? (uint(0), amountOut) : (amountOut, uint(0));
+            address to = i < path.length - 2 ? UniswapV2Library.pairFor(factory, output, path[i + 2]) : _to;
+            IUniswapV2Pair(UniswapV2Library.pairFor(factory, input, output)).swap(
+                amount0Out, amount1Out, to, new bytes(0)
+            );
+        }
+    }
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external virtual override ensure(deadline) returns (uint[] memory amounts) {
+        amounts = UniswapV2Library.getAmountsOut(factory, amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(
+            path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]
+        );
+        _swap(amounts, path, to);
+    }
+    function swapTokensForExactTokens(
+        uint amountOut,
+        uint amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external virtual override ensure(deadline) returns (uint[] memory amounts) {
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= amountInMax, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(
+            path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]
+        );
+        _swap(amounts, path, to);
+    }
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        virtual
+        override
+        payable
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[0] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsOut(factory, msg.value, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        IWETH(WETH).deposit{value: amounts[0]}();
+        assert(IWETH(WETH).transfer(UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]));
+        _swap(amounts, path, to);
+    }
+    function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+        external
+        virtual
+        override
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[path.length - 1] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= amountInMax, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(
+            path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]
+        );
+        _swap(amounts, path, address(this));
+        IWETH(WETH).withdraw(amounts[amounts.length - 1]);
+        TransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);
+    }
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        virtual
+        override
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[path.length - 1] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsOut(factory, amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(
+            path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]
+        );
+        _swap(amounts, path, address(this));
+        IWETH(WETH).withdraw(amounts[amounts.length - 1]);
+        TransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);
+    }
+    function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+        external
+        virtual
+        override
+        payable
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[0] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= msg.value, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        IWETH(WETH).deposit{value: amounts[0]}();
+        assert(IWETH(WETH).transfer(UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]));
+        _swap(amounts, path, to);
+        // refund dust eth, if any
+        if (msg.value > amounts[0]) TransferHelper.safeTransferETH(msg.sender, msg.value - amounts[0]);
+    }
+
+    // **** SWAP (supporting fee-on-transfer tokens) ****
+    // requires the initial amount to have already been sent to the first pair
+    function _swapSupportingFeeOnTransferTokens(address[] memory path, address _to) internal virtual {
+        for (uint i; i < path.length - 1; i++) {
+            (address input, address output) = (path[i], path[i + 1]);
+            (address token0,) = UniswapV2Library.sortTokens(input, output);
+            IUniswapV2Pair pair = IUniswapV2Pair(UniswapV2Library.pairFor(factory, input, output));
+            uint amountInput;
+            uint amountOutput;
+            { // scope to avoid stack too deep errors
+            (uint reserve0, uint reserve1,) = pair.getReserves();
+            (uint reserveInput, uint reserveOutput) = input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
+            amountInput = IERC20(input).balanceOf(address(pair)).sub(reserveInput);
+            amountOutput = UniswapV2Library.getAmountOut(amountInput, reserveInput, reserveOutput);
+            }
+            (uint amount0Out, uint amount1Out) = input == token0 ? (uint(0), amountOutput) : (amountOutput, uint(0));
+            address to = i < path.length - 2 ? UniswapV2Library.pairFor(factory, output, path[i + 2]) : _to;
+            pair.swap(amount0Out, amount1Out, to, new bytes(0));
+        }
+    }
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external virtual override ensure(deadline) {
+        TransferHelper.safeTransferFrom(
+            path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amountIn
+        );
+        uint balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);
+        _swapSupportingFeeOnTransferTokens(path, to);
+        require(
+            IERC20(path[path.length - 1]).balanceOf(to).sub(balanceBefore) >= amountOutMin,
+            'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT'
+        );
+    }
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    )
+        external
+        virtual
+        override
+        payable
+        ensure(deadline)
+    {
+        require(path[0] == WETH, 'UniswapV2Router: INVALID_PATH');
+        uint amountIn = msg.value;
+        IWETH(WETH).deposit{value: amountIn}();
+        assert(IWETH(WETH).transfer(UniswapV2Library.pairFor(factory, path[0], path[1]), amountIn));
+        uint balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);
+        _swapSupportingFeeOnTransferTokens(path, to);
+        require(
+            IERC20(path[path.length - 1]).balanceOf(to).sub(balanceBefore) >= amountOutMin,
+            'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT'
+        );
+    }
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    )
+        external
+        virtual
+        override
+        ensure(deadline)
+    {
+        require(path[path.length - 1] == WETH, 'UniswapV2Router: INVALID_PATH');
+        TransferHelper.safeTransferFrom(
+            path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amountIn
+        );
+        _swapSupportingFeeOnTransferTokens(path, address(this));
+        uint amountOut = IERC20(WETH).balanceOf(address(this));
+        require(amountOut >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        IWETH(WETH).withdraw(amountOut);
+        TransferHelper.safeTransferETH(to, amountOut);
+    }
+
+    // **** LIBRARY FUNCTIONS ****
+    function quote(uint amountA, uint reserveA, uint reserveB) public pure virtual override returns (uint amountB) {
+        return UniswapV2Library.quote(amountA, reserveA, reserveB);
+    }
+
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut)
+        public
+        pure
+        virtual
+        override
+        returns (uint amountOut)
+    {
+        return UniswapV2Library.getAmountOut(amountIn, reserveIn, reserveOut);
+    }
+
+    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut)
+        public
+        pure
+        virtual
+        override
+        returns (uint amountIn)
+    {
+        return UniswapV2Library.getAmountIn(amountOut, reserveIn, reserveOut);
+    }
+
+    function getAmountsOut(uint amountIn, address[] memory path)
+        public
+        view
+        virtual
+        override
+        returns (uint[] memory amounts)
+    {
+        return UniswapV2Library.getAmountsOut(factory, amountIn, path);
+    }
+
+    function getAmountsIn(uint amountOut, address[] memory path)
+        public
+        view
+        virtual
+        override
+        returns (uint[] memory amounts)
+    {
+        return UniswapV2Library.getAmountsIn(factory, amountOut, path);
+    }
+}
+```
+
+# <font style="color:rgb(28, 30, 33);">Address</font>
+
+<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">UniswapV2Router02</font>**</code>**<font style="color:rgb(28, 30, 33);"> </font>****<font style="color:rgb(28, 30, 33);">is deployed at</font>****<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D</font>**</code>**<font style="color:rgb(28, 30, 33);"> </font>****<font style="color:rgb(28, 30, 33);">on the Ethereum</font>****<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">mainnet</font>**](https://etherscan.io/address/0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D)**<font style="color:rgb(28, 30, 33);">, and the</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Ropsten</font>**](https://ropsten.etherscan.io/address/0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D)**<font style="color:rgb(28, 30, 33);">,</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Rinkeby</font>**](https://rinkeby.etherscan.io/address/0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D)**<font style="color:rgb(28, 30, 33);">,</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Görli</font>**](https://goerli.etherscan.io/address/0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D)**<font style="color:rgb(28, 30, 33);">, and</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Kovan</font>**](https://kovan.etherscan.io/address/0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D)**<font style="color:rgb(28, 30, 33);"> </font>****<font style="color:rgb(28, 30, 33);">testnets. It was built from commit</font>****<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">6961711</font>**](https://github.com/Uniswap/uniswap-v2-periphery/tree/69617118cda519dab608898d62aaa79877a61004)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+# <font style="color:rgb(28, 30, 33);">Read-Only Functions</font>
+
+## <font style="color:rgb(28, 30, 33);">factory</font>
+
+```solidity
+function factory() external pure returns (address);
+```
+
+**<font style="color:rgb(28, 30, 33);">Returns</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">factory address</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/factory#address)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+## <font style="color:rgb(28, 30, 33);">WETH</font>
+
+```solidity
+function WETH() external pure returns (address);
+```
+
+**<font style="color:rgb(28, 30, 33);">Returns the</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">canonical WETH address</font>**](https://blog.0xproject.com/canonical-weth-a9aa7d0279dd)**<font style="color:rgb(28, 30, 33);"> </font>****<font style="color:rgb(28, 30, 33);">on the Ethereum</font>****<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">mainnet</font>**](https://etherscan.io/address/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2)**<font style="color:rgb(28, 30, 33);">, or the</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Ropsten</font>**](https://ropsten.etherscan.io/address/0xc778417e063141139fce010982780140aa0cd5ab)**<font style="color:rgb(28, 30, 33);">,</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Rinkeby</font>**](https://rinkeby.etherscan.io/address/0xc778417e063141139fce010982780140aa0cd5ab)**<font style="color:rgb(28, 30, 33);">,</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Görli</font>**](https://goerli.etherscan.io/address/0xb4fbf271143f4fbf7b91a5ded31805e42b2208d6)**<font style="color:rgb(28, 30, 33);">, or</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">Kovan</font>**](https://kovan.etherscan.io/address/0xd0a1e359811322d97991e03f863a0c30c2cf029c)**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">testnets.</font>**
+
+## <font style="color:rgb(28, 30, 33);">quote</font>
+
+**<font style="color:rgb(28, 30, 33);">See</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">quote</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/library#quote)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+## <font style="color:rgb(28, 30, 33);">getAmountOut</font>
+
+**<font style="color:rgb(28, 30, 33);">See</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">getAmountOut</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/library#getamountout)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+## <font style="color:rgb(28, 30, 33);">getAmountIn</font>
+
+**<font style="color:rgb(28, 30, 33);">See</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">getAmountIn</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/library#getamountin)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+## <font style="color:rgb(28, 30, 33);">getAmountsOut</font>
+
+```solidity
+function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">See</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">getAmountsOut</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/library#getamountsout)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+## <font style="color:rgb(28, 30, 33);">getAmountsIn</font>
+
+```solidity
+function getAmountsIn(uint amountOut, address[] memory path) public view returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">See</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">getAmountsIn</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/library#getamountsin)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+# <font style="color:rgb(28, 30, 33);">State-Changing Functions</font>
+
+## <font style="color:rgb(28, 30, 33);">addLiquidity</font>
+
+```solidity
+function addLiquidity(
+  address tokenA,
+  address tokenB,
+  uint amountADesired,
+  uint amountBDesired,
+  uint amountAMin,
+  uint amountBMin,
+  address to,
+  uint deadline
+) external returns (uint amountA, uint amountB, uint liquidity);
+```
+
+**<font style="color:rgb(28, 30, 33);">Adds liquidity to an ERC-20⇄ERC-20 pool.</font>**
+
+* <font style="color:rgb(34, 34, 34) !important;">To cover all possible scenarios,</font><font style="color:rgb(34, 34, 34) !important;"> </font><code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least amountADesired/amountBDesired on tokenA/tokenB.</font>
+* <font style="color:rgb(34, 34, 34) !important;">Always adds assets at the ideal ratio, according to the price when the transaction is executed.</font>
+* <font style="color:rgb(34, 34, 34) !important;">If a pool for the passed tokens does not exists, one is created automatically, and exactly amountADesired/amountBDesired tokens are added.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">tokenA</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">tokenB</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountADesired</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenA to add as liquidity if the B/A price is <= amountBDesired/amountADesired (A depreciates).</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountBDesired</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenB to add as liquidity if the A/B price is <= amountADesired/amountBDesired (B depreciates).</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountAMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Bounds the extent to which the B/A price can go up before the transaction reverts. Must be <= amountADesired.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountBMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Bounds the extent to which the A/B price can go up before the transaction reverts. Must be <= amountBDesired.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the liquidity tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountA</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenA sent to the pool.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountB</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenB sent to the pool.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens minted.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">addLiquidityETH</font>
+
+```solidity
+function addLiquidityETH(
+  address token,
+  uint amountTokenDesired,
+  uint amountTokenMin,
+  uint amountETHMin,
+  address to,
+  uint deadline
+) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+```
+
+**<font style="color:rgb(28, 30, 33);">Adds liquidity to an ERC-20⇄WETH pool with ETH.</font>**
+
+* <font style="color:rgb(34, 34, 34) !important;">To cover all possible scenarios,</font><font style="color:rgb(34, 34, 34) !important;"> </font><code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least amountTokenDesired on token.</font>
+* <font style="color:rgb(34, 34, 34) !important;">Always adds assets at the ideal ratio, according to the price when the transaction is executed.</font>
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.value</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">is treated as a amountETHDesired.</font>
+* <font style="color:rgb(34, 34, 34) !important;">Leftover ETH, if any, is returned to</font><font style="color:rgb(34, 34, 34) !important;"> </font><code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;">.</font>
+* <font style="color:rgb(34, 34, 34) !important;">If a pool for the passed token and WETH does not exists, one is created automatically, and exactly amountTokenDesired/</font><code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.value</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">tokens are added.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">token</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountTokenDesired</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of token to add as liquidity if the WETH/token price is <=</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">msg.value</font>**</code><br/>**<font style="color:rgb(28, 30, 33);">/amountTokenDesired (token depreciates).</font>** |
+| <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">msg.value</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">(amountETHDesired)</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH to add as liquidity if the token/WETH price is <= amountTokenDesired/</font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">msg.value</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">(WETH depreciates).</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountTokenMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Bounds the extent to which the WETH/token price can go up before the transaction reverts. Must be <= amountTokenDesired.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETHMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Bounds the extent to which the token/WETH price can go up before the transaction reverts. Must be <=</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">msg.value</font>**</code><br/>**<font style="color:rgb(28, 30, 33);">.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the liquidity tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountToken</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of token sent to the pool.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETH</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH converted to WETH and sent to the pool.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens minted.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">removeLiquidity</font>
+
+```solidity
+function removeLiquidity(
+  address tokenA,
+  address tokenB,
+  uint liquidity,
+  uint amountAMin,
+  uint amountBMin,
+  address to,
+  uint deadline
+) external returns (uint amountA, uint amountB);
+```
+
+**<font style="color:rgb(28, 30, 33);">Removes liquidity from an ERC-20⇄ERC-20 pool.</font>**
+
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least liquidity on the pool.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">tokenA</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">tokenB</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens to remove.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountAMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of tokenA that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountBMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of tokenB that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the underlying assets.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountA</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenA received.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountB</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenB received.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">removeLiquidityETH</font>
+
+```solidity
+function removeLiquidityETH(
+  address token,
+  uint liquidity,
+  uint amountTokenMin,
+  uint amountETHMin,
+  address to,
+  uint deadline
+) external returns (uint amountToken, uint amountETH);
+```
+
+**<font style="color:rgb(28, 30, 33);">Removes liquidity from an ERC-20⇄WETH pool and receive ETH.</font>**
+
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least liquidity on the pool.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">token</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens to remove.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountTokenMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of token that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETHMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of ETH that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the underlying assets.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountToken</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of token received.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETH</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH received.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">removeLiquidityWithPermit</font>
+
+```solidity
+function removeLiquidityWithPermit(
+  address tokenA,
+  address tokenB,
+  uint liquidity,
+  uint amountAMin,
+  uint amountBMin,
+  address to,
+  uint deadline,
+  bool approveMax, uint8 v, bytes32 r, bytes32 s
+) external returns (uint amountA, uint amountB);
+```
+
+**<font style="color:rgb(28, 30, 33);">Removes liquidity from an ERC-20⇄ERC-20 pool without pre-approval, thanks to</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">permit</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/pair-erc-20#permit)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">tokenA</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">tokenB</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens to remove.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountAMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of tokenA that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountBMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of tokenB that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the underlying assets.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">approveMax</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bool</font>**</code> | **<font style="color:rgb(28, 30, 33);">Whether or not the approval amount in the signature is for liquidity or</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint(-1)</font>**</code><br/>**<font style="color:rgb(28, 30, 33);">.</font>** |
+| **<font style="color:rgb(28, 30, 33);">v</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint8</font>**</code> | **<font style="color:rgb(28, 30, 33);">The v component of the permit signature.</font>** |
+| **<font style="color:rgb(28, 30, 33);">r</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bytes32</font>**</code> | **<font style="color:rgb(28, 30, 33);">The r component of the permit signature.</font>** |
+| **<font style="color:rgb(28, 30, 33);">s</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bytes32</font>**</code> | **<font style="color:rgb(28, 30, 33);">The s component of the permit signature.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountA</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenA received.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountB</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokenB received.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">removeLiquidityETHWithPermit</font>
+
+```solidity
+function removeLiquidityETHWithPermit(
+  address token,
+  uint liquidity,
+  uint amountTokenMin,
+  uint amountETHMin,
+  address to,
+  uint deadline,
+  bool approveMax, uint8 v, bytes32 r, bytes32 s
+) external returns (uint amountToken, uint amountETH);
+```
+
+**<font style="color:rgb(28, 30, 33);">Removes liquidity from an ERC-20⇄WETTH pool and receive ETH without pre-approval, thanks to</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">permit</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/pair-erc-20#permit)**<font style="color:rgb(28, 30, 33);">.</font>**
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">token</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens to remove.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountTokenMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of token that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETHMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of ETH that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the underlying assets.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">approveMax</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bool</font>**</code> | **<font style="color:rgb(28, 30, 33);">Whether or not the approval amount in the signature is for liquidity or</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint(-1)</font>**</code><br/>**<font style="color:rgb(28, 30, 33);">.</font>** |
+| **<font style="color:rgb(28, 30, 33);">v</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint8</font>**</code> | **<font style="color:rgb(28, 30, 33);">The v component of the permit signature.</font>** |
+| **<font style="color:rgb(28, 30, 33);">r</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bytes32</font>**</code> | **<font style="color:rgb(28, 30, 33);">The r component of the permit signature.</font>** |
+| **<font style="color:rgb(28, 30, 33);">s</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bytes32</font>**</code> | **<font style="color:rgb(28, 30, 33);">The s component of the permit signature.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountToken</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of token received.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETH</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH received.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">removeLiquidityETHSupportingFeeOnTransferTokens</font>
+
+```solidity
+function removeLiquidityETHSupportingFeeOnTransferTokens(
+  address token,
+  uint liquidity,
+  uint amountTokenMin,
+  uint amountETHMin,
+  address to,
+  uint deadline
+) external returns (uint amountETH);
+```
+
+**<font style="color:rgb(28, 30, 33);">Identical to</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">removeLiquidityETH</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#removeliquidityeth)**<font style="color:rgb(28, 30, 33);">, but succeeds for tokens that take a fee on transfer.</font>**
+
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least liquidity on the pool.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">token</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens to remove.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountTokenMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of token that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETHMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of ETH that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the underlying assets.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountETH</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH received.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">removeLiquidityETHWithPermitSupportingFeeOnTransferTokens</font>
+
+```solidity
+function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+  address token,
+  uint liquidity,
+  uint amountTokenMin,
+  uint amountETHMin,
+  address to,
+  uint deadline,
+  bool approveMax, uint8 v, bytes32 r, bytes32 s
+) external returns (uint amountETH);
+```
+
+**<font style="color:rgb(28, 30, 33);">Identical to</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">removeLiquidityETHWithPermit</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#removeliquidityethwithpermit)**<font style="color:rgb(28, 30, 33);">, but succeeds for tokens that take a fee on transfer.</font>**
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">token</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">A pool token.</font>** |
+| **<font style="color:rgb(28, 30, 33);">liquidity</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of liquidity tokens to remove.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountTokenMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of token that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountETHMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of ETH that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the underlying assets.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">approveMax</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bool</font>**</code> | **<font style="color:rgb(28, 30, 33);">Whether or not the approval amount in the signature is for liquidity or</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint(-1)</font>**</code><br/>**<font style="color:rgb(28, 30, 33);">.</font>** |
+| **<font style="color:rgb(28, 30, 33);">v</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint8</font>**</code> | **<font style="color:rgb(28, 30, 33);">The v component of the permit signature.</font>** |
+| **<font style="color:rgb(28, 30, 33);">r</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bytes32</font>**</code> | **<font style="color:rgb(28, 30, 33);">The r component of the permit signature.</font>** |
+| **<font style="color:rgb(28, 30, 33);">s</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">bytes32</font>**</code> | **<font style="color:rgb(28, 30, 33);">The s component of the permit signature.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amountETH</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH received.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapExactTokensForTokens</font>
+
+```solidity
+function swapExactTokensForTokens(
+  uint amountIn,
+  uint amountOutMin,
+  address[] calldata path,
+  address to,
+  uint deadline
+) external returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">Swaps an exact amount of input tokens for as many output tokens as possible, along the route determined by the path. The first element of path is the input token, the last is the output token, and any intermediate elements represent intermediate pairs to trade through (if, for example, a direct pair does not exist).</font>**
+
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least amountIn on the input token.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">amountIn</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of input tokens to send.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountOutMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of output tokens that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the output tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amounts</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint[] memory</font>**</code> | **<font style="color:rgb(28, 30, 33);">The input token amount and all subsequent output token amounts.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapTokensForExactTokens</font>
+
+```solidity
+function swapTokensForExactTokens(
+  uint amountOut,
+  uint amountInMax,
+  address[] calldata path,
+  address to,
+  uint deadline
+) external returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">Receive an exact amount of output tokens for as few input tokens as possible, along the route determined by the path. The first element of path is the input token, the last is the output token, and any intermediate elements represent intermediate tokens to trade through (if, for example, a direct pair does not exist).</font>**
+
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least amountInMax on the input token.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">amountOut</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of output tokens to receive.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountInMax</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The maximum amount of input tokens that can be required before the transaction reverts.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the output tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amounts</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint[] memory</font>**</code> | **<font style="color:rgb(28, 30, 33);">The input token amount and all subsequent output token amounts.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapExactETHForTokens</font>
+
+```solidity
+function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+  external
+  payable
+  returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">Swaps an exact amount of ETH for as many output tokens as possible, along the route determined by the path. The first element of path must be</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">WETH</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#weth)**<font style="color:rgb(28, 30, 33);">, the last is the output token, and any intermediate elements represent intermediate pairs to trade through (if, for example, a direct pair does not exist).</font>**
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">msg.value</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">(amountIn)</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH to send.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountOutMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of output tokens that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the output tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amounts</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint[] memory</font>**</code> | **<font style="color:rgb(28, 30, 33);">The input token amount and all subsequent output token amounts.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapTokensForExactETH</font>
+
+```solidity
+function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+  external
+  returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">Receive an exact amount of ETH for as few input tokens as possible, along the route determined by the path. The first element of path is the input token, the last must be</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">WETH</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#weth)**<font style="color:rgb(28, 30, 33);">, and any intermediate elements represent intermediate pairs to trade through (if, for example, a direct pair does not exist).</font>**
+
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least amountInMax on the input token.</font>
+* <font style="color:rgb(34, 34, 34) !important;">If the to address is a smart contract, it must have the ability to receive ETH.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">amountOut</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH to receive.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountInMax</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The maximum amount of input tokens that can be required before the transaction reverts.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of ETH.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amounts</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint[] memory</font>**</code> | **<font style="color:rgb(28, 30, 33);">The input token amount and all subsequent output token amounts.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapExactTokensForETH</font>
+
+```solidity
+function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+  external
+  returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">Swaps an exact amount of tokens for as much ETH as possible, along the route determined by the path. The first element of path is the input token, the last must be</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">WETH</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#weth)**<font style="color:rgb(28, 30, 33);">, and any intermediate elements represent intermediate pairs to trade through (if, for example, a direct pair does not exist).</font>**
+
+* <font style="color:rgb(34, 34, 34) !important;">If the to address is a smart contract, it must have the ability to receive ETH.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">amountIn</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of input tokens to send.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountOutMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of output tokens that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the ETH.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amounts</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint[] memory</font>**</code> | **<font style="color:rgb(28, 30, 33);">The input token amount and all subsequent output token amounts.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapETHForExactTokens</font>
+
+```solidity
+function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+  external
+  payable
+  returns (uint[] memory amounts);
+```
+
+**<font style="color:rgb(28, 30, 33);">Receive an exact amount of tokens for as little ETH as possible, along the route determined by the path. The first element of path must be</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">WETH</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#weth)**<font style="color:rgb(28, 30, 33);">, the last is the output token and any intermediate elements represent intermediate pairs to trade through (if, for example, a direct pair does not exist).</font>**
+
+* <font style="color:rgb(34, 34, 34) !important;">Leftover ETH, if any, is returned to</font><font style="color:rgb(34, 34, 34) !important;"> </font><code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;">.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">amountOut</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of tokens to receive.</font>** |
+| <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">msg.value</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">(amountInMax)</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The maximum amount of ETH that can be required before the transaction reverts.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the output tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+| | | |
+| **<font style="color:rgb(28, 30, 33);">amounts</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint[] memory</font>**</code> | **<font style="color:rgb(28, 30, 33);">The input token amount and all subsequent output token amounts.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapExactTokensForTokensSupportingFeeOnTransferTokens</font>
+
+```solidity
+function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+  uint amountIn,
+  uint amountOutMin,
+  address[] calldata path,
+  address to,
+  uint deadline
+) external;
+```
+
+**<font style="color:rgb(28, 30, 33);">Identical to</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">swapExactTokensForTokens</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#swapexacttokensfortokens)**<font style="color:rgb(28, 30, 33);">, but succeeds for tokens that take a fee on transfer.</font>**
+
+* <code><font style="color:rgb(34, 34, 34) !important;background-color:rgb(246, 247, 248);">msg.sender</font></code><font style="color:rgb(34, 34, 34) !important;"> </font><font style="color:rgb(34, 34, 34) !important;">should have already given the router an allowance of at least amountIn on the input token.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">amountIn</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of input tokens to send.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountOutMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of output tokens that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the output tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapExactETHForTokensSupportingFeeOnTransferTokens</font>
+
+```solidity
+function swapExactETHForTokensSupportingFeeOnTransferTokens(
+  uint amountOutMin,
+  address[] calldata path,
+  address to,
+  uint deadline
+) external payable;
+```
+
+**<font style="color:rgb(28, 30, 33);">Identical to</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">swapExactETHForTokens</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#swapexactethfortokens)**<font style="color:rgb(28, 30, 33);">, but succeeds for tokens that take a fee on transfer.</font>**
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">msg.value</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">(amountIn)</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of ETH to send.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountOutMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of output tokens that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the output tokens.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+
+## <font style="color:rgb(28, 30, 33);">swapExactTokensForETHSupportingFeeOnTransferTokens</font>
+
+```solidity
+function swapExactTokensForETHSupportingFeeOnTransferTokens(
+  uint amountIn,
+  uint amountOutMin,
+  address[] calldata path,
+  address to,
+  uint deadline
+) external;
+```
+
+**<font style="color:rgb(28, 30, 33);">Identical to</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**[**<font style="color:rgb(239, 3, 172);">swapExactTokensForETH</font>**](https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#swapexacttokensforeth)**<font style="color:rgb(28, 30, 33);">, but succeeds for tokens that take a fee on transfer.</font>**
+
+* <font style="color:rgb(34, 34, 34) !important;">If the to address is a smart contract, it must have the ability to receive ETH.</font>
+
+| **<font style="color:rgb(28, 30, 33);">Name</font>** | **<font style="color:rgb(28, 30, 33);">Type</font>** | |
+| :--- | :--- | --- |
+| **<font style="color:rgb(28, 30, 33);">amountIn</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The amount of input tokens to send.</font>** |
+| **<font style="color:rgb(28, 30, 33);">amountOutMin</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">The minimum amount of output tokens that must be received for the transaction not to revert.</font>** |
+| **<font style="color:rgb(28, 30, 33);">path</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address[] calldata</font>**</code> | **<font style="color:rgb(28, 30, 33);">An array of token addresses.</font>\*\*\*\*<font style="color:rgb(28, 30, 33);"> </font>**<code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">path.length</font>**</code><br/>**<font style="color:rgb(28, 30, 33);"> </font>\*\*\*\*<font style="color:rgb(28, 30, 33);">must be >= 2. Pools for each consecutive pair of addresses must exist and have liquidity.</font>** |
+| **<font style="color:rgb(28, 30, 33);">to</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">address</font>**</code> | **<font style="color:rgb(28, 30, 33);">Recipient of the ETH.</font>** |
+| **<font style="color:rgb(28, 30, 33);">deadline</font>** | <code>**<font style="color:rgb(28, 30, 33);background-color:rgb(246, 247, 248);">uint</font>**</code> | **<font style="color:rgb(28, 30, 33);">Unix timestamp after which the transaction will revert.</font>** |
+
+# <font style="color:rgb(28, 30, 33);">Interface</font>
+
+```solidity
+import '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol';
+```
+
+```solidity
+pragma solidity >=0.6.2;
+
+interface IUniswapV2Router01 {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountA, uint amountB, uint liquidity);
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountA, uint amountB);
+    function removeLiquidityETH(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountToken, uint amountETH);
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountA, uint amountB);
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountToken, uint amountETH);
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapTokensForExactTokens(
+        uint amountOut,
+        uint amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        payable
+        returns (uint[] memory amounts);
+    function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+        external
+        returns (uint[] memory amounts);
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        returns (uint[] memory amounts);
+    function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+        external
+        payable
+        returns (uint[] memory amounts);
+
+    function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB);
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external pure returns (uint amountOut);
+    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) external pure returns (uint amountIn);
+    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+    function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+interface IUniswapV2Router02 is IUniswapV2Router01 {
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountETH);
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external returns (uint amountETH);
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable;
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+}
+```
+
+# <font style="color:rgb(28, 30, 33);">ABI</font>
+
+```typescript
+import IUniswapV2Router02 from '@uniswap/v2-periphery/build/IUniswapV2Router02.json'
+```
+
+[**<font style="color:rgb(239, 3, 172);">https://unpkg.com/@uniswap/v2-periphery@1.1.0-beta.0/build/IUniswapV2Router02.json</font>**](https://unpkg.com/@uniswap/v2-periphery@1.1.0-beta.0/build/IUniswapV2Router02.json)
+
+
+> 更新: 2025-09-29 19:34:18  
+> 原文: <https://www.yuque.com/xiaoyuhushenfu/yzin4n/vxkcekulg37mcksk>
